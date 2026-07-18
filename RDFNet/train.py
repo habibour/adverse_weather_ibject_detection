@@ -64,6 +64,21 @@ if __name__ == "__main__":
         if local_rank == 0:
             print("\nSuccessful Load Key:", str(load_key)[:500], "……\nSuccessful Load Key Num:", len(load_key))
             print("\nFail To Load Key:", str(no_load_key)[:500], "……\nFail To Load Key num:", len(no_load_key))
+
+    # DRM's `project` conv is meant to start as an exact identity (zero
+    # weight + zero bias, per its own __init__) so the residual branch can't
+    # perturb the converged checkpoint on day one. But weights_init(model)
+    # above runs BEFORE this checkpoint load and overwrites every Conv layer
+    # -- including DRM's, which has no matching key in model_path -- with
+    # small Gaussian noise (std=0.02) that never gets restored. Re-zero it
+    # explicitly here, after the load, so the identity-at-init guarantee
+    # actually holds.
+    if 'USE_DRM' in dir() and USE_DRM and hasattr(model, 'drm') and hasattr(model.drm, 'project'):
+        nn.init.zeros_(model.drm.project.weight)
+        nn.init.zeros_(model.drm.project.bias)
+        if local_rank == 0:
+            print('DRM project layer re-zeroed after checkpoint load (exact identity at init).')
+
     yolo_loss    = YOLOLoss(anchors, num_classes, input_shape, anchors_mask)
     if local_rank == 0:
         time_str        = datetime.datetime.strftime(datetime.datetime.now(),'%Y_%m_%d_%H_%M_%S')
@@ -119,7 +134,11 @@ if __name__ == "__main__":
         batch_size = Freeze_batch_size if Freeze_Train else Unfreeze_batch_size
         nbs             = 64
         lr_limit_max    = 1e-3 if optimizer_type == 'adam' else 5e-2
-        lr_limit_min    = 3e-4 if optimizer_type == 'adam' else 5e-4
+        lr_limit_min    = 3e-4 if optimizer_type == 'adam' else 1e-4  # lowered from 5e-4: that floor was
+                                                                       # binding for our fine-tune Init_lr
+                                                                       # (<=2e-3), re-heating an already-
+                                                                       # converged checkpoint more than
+                                                                       # intended -- see thesis notes.
         Init_lr_fit     = min(max(batch_size / nbs * Init_lr, lr_limit_min), lr_limit_max)
         Min_lr_fit      = min(max(batch_size / nbs * Min_lr, lr_limit_min * 1e-2), lr_limit_max * 1e-2)
         pg0, pg1, pg2 = [], [], []
@@ -163,7 +182,8 @@ if __name__ == "__main__":
                 batch_size = Unfreeze_batch_size
                 nbs             = 64
                 lr_limit_max    = 1e-3 if optimizer_type == 'adam' else 5e-2
-                lr_limit_min    = 3e-4 if optimizer_type == 'adam' else 5e-4
+                lr_limit_min    = 3e-4 if optimizer_type == 'adam' else 1e-4  # kept in sync with the
+                                                                               # initial block above
                 Init_lr_fit     = min(max(batch_size / nbs * Init_lr, lr_limit_min), lr_limit_max)
                 Min_lr_fit      = min(max(batch_size / nbs * Min_lr, lr_limit_min * 1e-2), lr_limit_max * 1e-2)
                 lr_scheduler_func = get_lr_scheduler(lr_decay_type, Init_lr_fit, Min_lr_fit, UnFreeze_Epoch)

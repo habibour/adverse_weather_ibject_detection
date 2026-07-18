@@ -5,6 +5,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+try:
+    from config import USE_WISE_IOU, USE_DWA
+except ImportError:
+    USE_WISE_IOU, USE_DWA = False, False
 def smooth_BCE(eps=0.1):
     return 1.0 - 0.5 * eps, 0.5 * eps
 class YOLOLoss(nn.Module):
@@ -22,6 +26,41 @@ class YOLOLoss(nn.Module):
         self.threshold      = 4
         self.cp, self.cn                    = smooth_BCE(eps=label_smoothing)
         self.BCEcls, self.BCEobj, self.gr   = nn.BCEWithLogitsLoss(), nn.BCEWithLogitsLoss(), 1
+
+        # --- Wise-IoU-style dynamic non-monotonic focusing, applied on top of CIoU ---
+        # Controlled by config.USE_WISE_IOU; False reproduces the paper's static-CIoU
+        # baseline exactly (used for the epoch-matched control run).
+        self.use_wiou        = USE_WISE_IOU
+        self.wiou_alpha      = 1.9
+        self.wiou_delta      = 3.0
+        self.register_buffer('iou_loss_mean', torch.tensor(1.0))
+
+        # --- Dynamic Weight Averaging (Liu et al., CVPR 2019) for the detection /
+        # dehaze task balance, replacing the paper's fixed lambda=0.1. Controlled by
+        # config.USE_DWA; False reproduces the fixed-lambda baseline exactly.
+        self.use_dwa          = USE_DWA
+        self.dwa_temperature  = 2.0
+        self.det_loss_hist    = []
+        self.dehaze_loss_hist = []
+
+    def get_task_weights(self):
+        """DWA weights for (detection, dehaze), computed from the previous two
+        epochs' average losses. Falls back to equal weights (1.0, 1.0) until
+        two epochs of history exist, or if use_dwa is False."""
+        if not self.use_dwa or len(self.det_loss_hist) < 2:
+            return 1.0, 1.0
+        r_det    = self.det_loss_hist[-1] / (self.det_loss_hist[-2] + 1e-8)
+        r_dehaze = self.dehaze_loss_hist[-1] / (self.dehaze_loss_hist[-2] + 1e-8)
+        e_det, e_dehaze = math.exp(r_det / self.dwa_temperature), math.exp(r_dehaze / self.dwa_temperature)
+        w_det    = 2 * e_det / (e_det + e_dehaze)
+        w_dehaze = 2 * e_dehaze / (e_det + e_dehaze)
+        return w_det, w_dehaze
+
+    def update_task_loss_history(self, det_loss_epoch, dehaze_loss_epoch):
+        self.det_loss_hist.append(det_loss_epoch)
+        self.dehaze_loss_hist.append(dehaze_loss_epoch)
+        self.det_loss_hist    = self.det_loss_hist[-2:]
+        self.dehaze_loss_hist = self.dehaze_loss_hist[-2:]
     def bbox_iou(self, box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
         box2 = box2.T
         if x1y1x2y2:
@@ -78,7 +117,17 @@ class YOLOLoss(nn.Module):
                 selected_tbox           = targets[i][:, 2:6] * feature_map_sizes[i]
                 selected_tbox[:, :2]    -= grid.type_as(prediction)
                 iou                     = self.bbox_iou(box.T, selected_tbox, x1y1x2y2=False, CIoU=True)
-                box_loss                += (1.0 - iou).mean()
+                if self.use_wiou:
+                    iou_loss            = 1.0 - iou
+                    if self.iou_loss_mean.device != iou_loss.device:
+                        self.iou_loss_mean = self.iou_loss_mean.to(iou_loss.device)
+                    with torch.no_grad():
+                        outlier_deg     = iou_loss.detach() / (self.iou_loss_mean + 1e-7)
+                        self.iou_loss_mean.mul_(0.99).add_(0.01 * iou_loss.detach().mean())
+                    r                   = outlier_deg / (self.wiou_delta * self.wiou_alpha ** (outlier_deg - self.wiou_delta))
+                    box_loss            += (r * iou_loss).mean()
+                else:
+                    box_loss            += (1.0 - iou).mean()
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)
                 selected_tcls               = targets[i][:, 1].long()
                 t                           = torch.full_like(prediction_pos[:, 5:], self.cn, device=device)

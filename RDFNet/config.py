@@ -26,6 +26,19 @@ save_dir            = 'logs'
 eval_flag           = True
 eval_period         = 10
 num_workers         = 0
-train_annotation_path   = '2007_train_fog.txt' 
+train_annotation_path   = '2007_train_fog.txt'
 val_annotation_path     = '2007_val_fog.txt'
 clear_annotation_path = '2007_train.txt'
+
+# --- Thesis modifications over the base paper, all default OFF so the ---
+# --- committed repo reproduces the base paper's exact behavior unless   ---
+# --- explicitly enabled (e.g. by the fine-tuning notebook).             ---
+# DRM: zero-init residual Detail Recovery Module at the P3 (finest) scale,
+#      targeting the small/thin-object weakness (bicycle, motorbike).
+USE_DRM         = False
+# Wise-IoU: dynamic non-monotonic focusing applied on top of the existing
+#           CIoU box-regression loss.
+USE_WISE_IOU    = False
+# DWA: Dynamic Weight Averaging (Liu et al., CVPR 2019) for the detection /
+#      dehaze task balance, replacing the fixed lambda=0.1 below.
+USE_DWA         = False

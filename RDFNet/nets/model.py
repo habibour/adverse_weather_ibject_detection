@@ -1,7 +1,11 @@
 import torch
 import torch.nn as nn
-from nets.Common import Conv, SPPELAN
+from nets.Common import Conv, SPPELAN, DRM
 from nets.backbone import Backbone, Multi_Concat_Block
+try:
+    from config import USE_DRM
+except ImportError:
+    USE_DRM = False
 
 def fuse_conv_and_bn(conv, bn):
     fusedconv = nn.Conv2d(conv.in_channels,
@@ -56,6 +60,14 @@ class YoloBody(nn.Module):
         self.conv_for_feat1         = Conv(transition_channels * 8, transition_channels * 4)
         self.conv3_for_upsample2    = Multi_Concat_Block(transition_channels * 8, panet_channels * 2, transition_channels * 4, e=e, n=n, ids=ids)
 
+        # Detail Recovery Module: zero-init residual detail/attention block at
+        # the finest (P3) scale, targeting the small/thin-object weakness
+        # (bicycle, motorbike) that RDFNet's RFE -- applied only at the coarse
+        # P5/SPP stage -- does not address. Falls back to a no-op identity
+        # when config.USE_DRM is False, so the "control" architecture used to
+        # isolate this module's contribution is byte-for-byte the base paper's.
+        self.drm = DRM(transition_channels * 4) if USE_DRM else nn.Identity()
+
         self.down_sample1           = Conv(transition_channels * 4, transition_channels * 8, k=3, s=2)
         self.conv3_for_downsample1  = Multi_Concat_Block(transition_channels * 16, panet_channels * 4, transition_channels * 8, e=e, n=n, ids=ids)
 
@@ -97,6 +109,7 @@ class YoloBody(nn.Module):
         P4_upsample = self.upsample(P4_conv)
         P3          = torch.cat([self.conv_for_feat1(feat1), P4_upsample], 1)
         P3          = self.conv3_for_upsample2(P3)
+        P3          = self.drm(P3)
 
         P3_downsample = self.down_sample1(P3)
         P4 = torch.cat([P3_downsample, P4], 1)

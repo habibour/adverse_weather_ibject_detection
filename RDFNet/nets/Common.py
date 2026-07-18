@@ -296,6 +296,86 @@ class SPPELAN(nn.Module):
         
 
 
+class ECA(nn.Module):
+    """Efficient Channel Attention (Wang et al., CVPR 2020) -- near-zero-parameter
+    channel attention via a 1D convolution over globally pooled channel descriptors.
+    Used inside DRM to cheaply recalibrate which channels matter after the
+    detail-recovery branches, without the cost of a full squeeze-excite MLP."""
+    def __init__(self, channels, k_size=3):
+        super(ECA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv     = nn.Conv1d(1, 1, kernel_size=k_size, padding=(k_size - 1) // 2, bias=False)
+        self.sigmoid  = nn.Sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)                             # (B, C, 1, 1)
+        y = y.squeeze(-1).transpose(-1, -2)                # (B, 1, C)
+        y = self.conv(y)                                   # (B, 1, C)
+        y = y.transpose(-1, -2).unsqueeze(-1)               # (B, C, 1, 1)
+        y = self.sigmoid(y)
+        return x * y
+
+
+class DepthwiseDilatedConv(nn.Module):
+    """Cheap depthwise dilated 3x3 conv + BN + activation. Depthwise keeps this
+    affordable at P3's high spatial resolution; the dilation rate controls how
+    much local context each branch of DRM gathers."""
+    def __init__(self, channels, dilation):
+        super(DepthwiseDilatedConv, self).__init__()
+        self.dw  = nn.Conv2d(channels, channels, kernel_size=3, stride=1,
+                              padding=dilation, dilation=dilation, groups=channels, bias=False)
+        self.bn  = nn.BatchNorm2d(channels, eps=0.001, momentum=0.03)
+        self.act = nn.LeakyReLU(0.1, inplace=True)
+
+    def forward(self, x):
+        return self.act(self.bn(self.dw(x)))
+
+
+class DRM(nn.Module):
+    """Detail Recovery Module.
+
+    RDFNet's RFE module enlarges the receptive field only at the coarse P5/SPP
+    stage. Small/thin objects (e.g. bicycle -- the weakest class on both
+    VOC-FOG and RTTS in the base paper's own per-class results) are detected
+    at the finer P3 scale, which receives no equivalent detail-recovery
+    treatment, and fog specifically attenuates the high-frequency detail such
+    objects depend on. DRM is a lightweight, residual sibling of RFE applied
+    at P3: two depthwise dilated-conv branches (dilation 1 and 2) recover
+    local detail at low channel width, an ECA block recalibrates channels,
+    and a 1x1 projection fuses back to the original channel count.
+
+    Implemented as a zero-initialized residual branch --
+        P3_out = P3 + f(P3)
+    -- with f's final projection weight and bias initialized to zero, so the
+    module is an exact identity function at the start of fine-tuning from a
+    converged checkpoint. It can only begin contributing as training moves
+    those weights away from zero, which bounds the downside if the fine-tune
+    budget turns out to be too short for it to learn something useful.
+    """
+    def __init__(self, channels, reduction=2):
+        super(DRM, self).__init__()
+        hidden = max(channels // reduction, 8)
+        self.reduce  = Conv(channels, hidden, 1, 1)
+        self.branch1 = DepthwiseDilatedConv(hidden, dilation=1)
+        self.branch2 = DepthwiseDilatedConv(hidden, dilation=2)
+        self.eca     = ECA(hidden * 2)
+        self.project = nn.Conv2d(hidden * 2, channels, kernel_size=1, stride=1, bias=True)
+
+        # Zero-init: this branch must start as an identity function so it
+        # cannot destabilize an already-converged checkpoint on epoch 0.
+        nn.init.zeros_(self.project.weight)
+        nn.init.zeros_(self.project.bias)
+
+    def forward(self, x):
+        y  = self.reduce(x)
+        y1 = self.branch1(y)
+        y2 = self.branch2(y)
+        y  = torch.cat([y1, y2], dim=1)
+        y  = self.eca(y)
+        y  = self.project(y)
+        return x + y
+
+
 def print_model_flops_and_params(model, inputs):
     flops, params = profile(model, inputs=inputs)
     print(f"FLOPs: {flops / 1e9:.2f} GFLOPs")
